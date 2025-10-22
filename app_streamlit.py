@@ -5,38 +5,79 @@ import pandas as pd
 import plotly.graph_objects as go
 
 # --- Local modules ---
-from data_fetcher import fetch_history
-from model_trainer import load_ensemble, make_features, predict_proba_ensemble
+from data_fetcher import fetch_history, fetch_company_news
+from model_trainer import load_ensemble, make_features, predict_proba_ensemble, train_symbol
 from signal_engine import news_sentiment_score, combine_signal
 from universe_fetcher import fetch_bist_all, fetch_sp500_wiki, fetch_nasdaq_all, get_cached_universes
 from portfolio_backtest import backtest_multi
 from binance_portfolio import build_returns_matrix, optimize_and_backtest
 
-# ---------- Setup ----------
+# ---------- Setup: env + secrets ----------
 load_dotenv()
-st.set_page_config(layout="wide", page_title="Mini‑Terminal Pro — ULTIMATE V9 (Patched)")
+# Streamlit Cloud 'Secrets' fallback
+if "FINNHUB_API_KEY" not in os.environ:
+    try:
+        os.environ["FINNHUB_API_KEY"] = st.secrets.get("FINNHUB_API_KEY","")
+    except Exception:
+        pass
 
-# Inject premium CSS if present
-from pathlib import Path
+st.set_page_config(layout="wide", page_title="Mini‑Terminal Pro — FUNCTIONS+")
+st.markdown("<style> .block-container{max-width:1400px;} </style>", unsafe_allow_html=True)
+
+# Inject CSS if available
 css_path = Path("assets/style.css")
 if css_path.exists():
     try:
         st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
-    except Exception as e:
-        st.warning(f"Stil dosyası okunamadı: {e}")
-else:
-    st.info("Not: assets/style.css bulunamadı. (Tema olmadan devam ediliyor.)")
+    except Exception:
+        pass
 
-st.markdown('<h1 style="margin-bottom:0.2rem;">Mini‑Terminal Pro — ULTIMATE V9</h1>', unsafe_allow_html=True)
-st.caption("Koyu tema • Neon vurgu • Terminal görünümü")
+st.markdown('<h1 style="margin-bottom:0.2rem;">Mini‑Terminal Pro — FUNCTIONS+</h1>', unsafe_allow_html=True)
 
-# Load config
+# Load config safely
 try:
     with open("config.yaml","r",encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 except Exception as e:
     st.error(f"config.yaml okunamadı: {e}")
     st.stop()
+
+# ---------- Helper panels ----------
+def panel_getting_started():
+    st.info("""
+**Başlamak için 3 adım:**
+1) **Finnhub API** anahtarını ekle → *Manage app → Settings → Secrets* → `FINNHUB_API_KEY`.
+2) **Evren Yönetimi** sekmesinde: *S&P500'ü Güncelle* (hızlıdır) → Keşfet & Grafik'te sembol seçip grafiği gör.
+3) **Yapay Zeka Tahmin** sekmesinde **Hızlı Eğitim** butonu ile `SPY` için model eğit → tahmin çalışır.
+""")
+
+def ensure_universes_seeded():
+    """Return universes; if all empty, seed demo tickers so app is usable without API."""
+    try:
+        u = get_cached_universes()
+    except Exception:
+        u = {"bist": pd.DataFrame(), "sp500": pd.DataFrame(), "nasdaq": pd.DataFrame()}
+    empty = sum([0 if (isinstance(df, pd.DataFrame) and not df.empty) else 1 for df in u.values()]) == 3
+    if empty:
+        u["sp500"] = pd.DataFrame([
+            {"symbol":"SPY","name":"SPDR S&P 500 ETF","sector":"ETF"},
+            {"symbol":"AAPL","name":"Apple Inc.","sector":"Information Technology"},
+            {"symbol":"MSFT","name":"Microsoft Corp.","sector":"Information Technology"},
+        ])
+        u["bist"] = pd.DataFrame([
+            {"symbol":"THYAO.IS","name":"Turkish Airlines","sector":"Industrials"},
+            {"symbol":"GARAN.IS","name":"Garanti BBVA","sector":"Financials"},
+        ])
+        u["nasdaq"] = pd.DataFrame([
+            {"symbol":"NVDA","name":"NVIDIA Corp.","sector":"Information Technology"},
+            {"symbol":"AMZN","name":"Amazon.com, Inc.","sector":"Consumer Discretionary"},
+        ])
+    # Drop dups, keep schema
+    for k,v in u.items():
+        if isinstance(v, pd.DataFrame) and not v.empty:
+            cols = [c for c in ("symbol","name","sector") if c in v.columns]
+            u[k] = v[cols].drop_duplicates()
+    return u
 
 # ---------- Tabs ----------
 tabs = st.tabs([
@@ -48,17 +89,9 @@ tabs = st.tabs([
     "Kripto (Binance)"
 ])
 
-# Helper: safe universe getter
-def safe_universe():
-    try:
-        u = get_cached_universes()
-        for k, v in u.items():
-            if isinstance(v, pd.DataFrame):
-                u[k] = v.drop_duplicates()
-        return u
-    except Exception as e:
-        st.error(f"Evren yüklenemedi: {e}")
-        return {"bist": pd.DataFrame(), "sp500": pd.DataFrame(), "nasdaq": pd.DataFrame()}
+# Getting started banner
+with st.expander("İlk kez mi kullanıyorsun? (Kısaca okunur)", expanded=True):
+    panel_getting_started()
 
 # -------- Evren Yönetimi --------
 with tabs[0]:
@@ -85,13 +118,15 @@ with tabs[0]:
                 st.success(f"NASDAQ güncellendi: {len(df)} kayıt")
             except Exception as e:
                 st.error(f"Hata: {e}")
-    uni = safe_universe()
+    uni = ensure_universes_seeded()
     st.write({k: (len(v) if isinstance(v, pd.DataFrame) else 0) for k,v in uni.items()})
+    if not os.getenv("FINNHUB_API_KEY"):
+        st.warning("Finnhub anahtarı eklemediğin için BIST ve News özellikleri sınırlı çalışır. (Yine de S&P 500/Wikipedia kısmı çalışır.)")
 
 # -------- Keşfet & Grafik --------
 with tabs[1]:
     st.subheader("Sektör filtreli grafik")
-    uni = safe_universe()
+    uni = ensure_universes_seeded()
     src = st.selectbox("Kaynak", ["bist","sp500","nasdaq"], key="explore_src")
     dfu = uni.get(src, pd.DataFrame())
     if dfu is None or dfu.empty:
@@ -105,7 +140,7 @@ with tabs[1]:
         if symbol:
             dfp = fetch_history(symbol, start=cfg['data']['start_date'])
             if dfp is None or dfp.empty:
-                st.warning("Veri bulunamadı.")
+                st.warning("Veri bulunamadı veya kaynak bu sembolü desteklemiyor.")
             else:
                 fig = go.Figure(data=[go.Candlestick(x=dfp.index, open=dfp['Open'], high=dfp['High'], low=dfp['Low'], close=dfp['Close'])])
                 st.plotly_chart(fig, use_container_width=True)
@@ -114,17 +149,28 @@ with tabs[1]:
 # -------- Yapay Zeka Tahmin --------
 with tabs[2]:
     st.subheader("YUKARI / AŞAĞI tahmini ve güven skoru")
-    uni = safe_universe()
+    uni = ensure_universes_seeded()
     src = st.selectbox("Kaynak (tahmin)", ["bist","sp500","nasdaq"], key="pred_src")
     dfu = uni.get(src, pd.DataFrame())
+    # Quick Train if no model
+    models = load_ensemble()
+    cols = st.columns([3,1])
+    with cols[1]:
+        if st.button("Hızlı Eğitim (SPY)", key="quick_train"):
+            try:
+                out = train_symbol("SPY", cfg)
+                st.success(f"Eğitim tamam: {out}")
+                models = load_ensemble()
+            except Exception as e:
+                st.error(f"Eğitim hatası: {e}")
     if dfu is None or dfu.empty:
         st.info("Önce evreni güncelle.")
     else:
         options = dfu['symbol'].dropna().astype(str).tolist()
-        symbol = st.selectbox("Sembol (tahmin)", options, key="pred_sym")
-        models = load_ensemble()
+        sel_default = options.index("SPY") if "SPY" in options else 0
+        symbol = st.selectbox("Sembol (tahmin)", options, index=sel_default, key="pred_sym")
         if not models:
-            st.info("Model yok. `models/` klasörüne en az bir LightGBM .pkl koyun veya eğitim yapın.")
+            st.warning("Henüz model yok. Sağdaki **Hızlı Eğitim** düğmesiyle SPY için model oluşturabilirsin.")
         else:
             df = fetch_history(symbol, start=cfg['data']['start_date'])
             if df is None or df.empty:
@@ -139,7 +185,12 @@ with tabs[2]:
                 prob = predict_proba_ensemble(models, X) if X is not None else 0.5
                 if prob is None:
                     prob = 0.5
-                senti, _ = news_sentiment_score(symbol, hours=cfg['signal']['sentiment_lookback_days']*8)
+                senti = 0.0
+                if os.getenv("FINNHUB_API_KEY"):
+                    try:
+                        senti, _ = news_sentiment_score(symbol, hours=cfg['signal']['sentiment_lookback_days']*8)
+                    except Exception:
+                        pass
                 score = combine_signal(prob, senti, cfg)
                 label = "YUKARI" if prob >= 0.5 else "AŞAĞI"
                 st.metric("Tahmin", label, delta=f"Güven: {prob:.2f}")
@@ -151,7 +202,9 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Anlık Haber Akışı — Sentiment Momentum")
     st.markdown(f"<meta http-equiv='refresh' content='{cfg['signal']['news_refresh_seconds']}'>", unsafe_allow_html=True)
-    uni = safe_universe()
+    if not os.getenv("FINNHUB_API_KEY"):
+        st.warning("News Trading için Finnhub anahtarı gerekir. *Manage app → Settings → Secrets* → `FINNHUB_API_KEY`.")
+    uni = ensure_universes_seeded()
     src = st.selectbox("Kaynak (haber)", ["bist","sp500","nasdaq"], key="news_src")
     dfu = uni.get(src, pd.DataFrame())
     if dfu is None or dfu.empty:
@@ -160,27 +213,26 @@ with tabs[3]:
         options = dfu['symbol'].dropna().astype(str).tolist()
         symbol = st.selectbox("Sembol (haber)", options, key="news_sym")
         hours = st.slider("Son kaç saat", 1, 24, 6, key="news_hours")
-        try:
-            senti_now, news_df = news_sentiment_score(symbol, hours=hours)
-            prev_senti, _ = news_sentiment_score(symbol, hours=min(hours*2,24))
-        except Exception as e:
-            st.error(f"Haber/duygu verisi alınamadı: {e}")
-            senti_now, prev_senti, news_df = 0.0, 0.0, pd.DataFrame()
-        trend = "↑ Artış" if senti_now > prev_senti else ("↓ Düşüş" if senti_now < prev_senti else "→ Durağan")
-        st.metric("Anlık Haber Sentiment", f"{senti_now:.3f}", delta=trend)
-        st.caption(f"Otomatik yenileme: {cfg['signal']['news_refresh_seconds']} sn")
-        if news_df is None or news_df.empty:
-            st.info("Bu pencerede haber bulunamadı.")
-        else:
+        if os.getenv("FINNHUB_API_KEY"):
             try:
-                st.dataframe(news_df[['datetime','headline','score']])
-            except Exception:
-                st.dataframe(news_df)
+                senti_now, news_df = news_sentiment_score(symbol, hours=hours)
+                prev_senti, _ = news_sentiment_score(symbol, hours=min(hours*2,24))
+                trend = "↑ Artış" if senti_now > prev_senti else ("↓ Düşüş" if senti_now < prev_senti else "→ Durağan")
+                st.metric("Anlık Haber Sentiment", f"{senti_now:.3f}", delta=trend)
+                st.caption(f"Otomatik yenileme: {cfg['signal']['news_refresh_seconds']} sn")
+                if news_df is None or news_df.empty:
+                    st.info("Bu pencerede haber bulunamadı.")
+                else:
+                    st.dataframe(news_df[['datetime','headline','score']])
+            except Exception as e:
+                st.error(f"Haber/duygu verisi alınamadı: {e}")
+        else:
+            st.info("API anahtarı ekleyince bu panel otomatik çalışacak.")
 
 # -------- Portföy (Hisse) --------
 with tabs[4]:
     st.subheader("Sektör bazlı portföy optimizasyonu + maliyetli backtest")
-    uni = safe_universe()
+    uni = ensure_universes_seeded()
     src = st.selectbox("Kaynak (portföy)", ["bist","sp500","nasdaq"], key="port_src")
     dfu = uni.get(src, pd.DataFrame())
     if dfu is None or dfu.empty:
@@ -195,19 +247,22 @@ with tabs[4]:
         fee = st.number_input("Ücret (bp)", 0, 100, 10, key="port_fee")
         slp = st.number_input("Slippage (bp)", 0, 100, 5, key="port_slp")
         if st.button("Backtest Çalıştır", key="port_run"):
-            rets = []
-            for s in picks[:30]:
-                dfp = fetch_history(s, start=cfg['data']['start_date'])
-                if dfp is None or dfp.empty:
-                    continue
-                rets.append(dfp['Close'].pct_change().rename(s))
-            if not rets:
-                st.error("Getiri serileri alınamadı.")
+            if not picks:
+                st.warning("Önce birkaç sembol seç.")
             else:
-                R = pd.concat(rets, axis=1).dropna()
-                eq, w = backtest_multi(R, method=method, rebalance=reb, fee_bp=fee, slippage_bp=slp)
-                st.line_chart(eq.rename("Portföy"))
-                st.write("Son ağırlıklar:", w)
+                rets = []
+                for s in picks[:30]:
+                    dfp = fetch_history(s, start=cfg['data']['start_date'])
+                    if dfp is None or dfp.empty:
+                        continue
+                    rets.append(dfp['Close'].pct_change().rename(s))
+                if not rets:
+                    st.error("Getiri serileri alınamadı.")
+                else:
+                    R = pd.concat(rets, axis=1).dropna()
+                    eq, w = backtest_multi(R, method=method, rebalance=reb, fee_bp=fee, slippage_bp=slp)
+                    st.line_chart(eq.rename("Portföy"))
+                    st.write("Son ağırlıklar:", w)
 
 # -------- Kripto (Binance) --------
 with tabs[5]:
